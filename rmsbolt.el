@@ -283,6 +283,9 @@ Useful if you have multiple objdumpers and want to select between them")
 (defvar rmsbolt--temp-dirs-hash (make-hash-table :test #'equal)
   "Hash table mapping file path remote components to a 'local' temporary directory.")
 
+(defvar rmsbolt--remote-path-comparison nil
+  "Non-nil while processing source paths from a remote buffer.")
+
 ;;;; Variable-like funcs
 (defun rmsbolt-output-filename (src-buffer &optional asm)
   "Function for generating an output filename for SRC-BUFFER.
@@ -458,14 +461,19 @@ Return value is quoted for passing to the shell."
 Checks the existence of the file when the paths are either both local or remote,
 otherwise returns whether the paths are equal and does not check whether they
 point to a file that exists."
-  ;; When possible verify the file's existence, otherwise fall back to comparing
-  ;; paths.  The fallback is necessary when the paths provided are the local
-  ;; components of remote paths that don't exist on the current system.
-  (or (and (equal (file-remote-p src-path)
-                  (file-remote-p target-path))
-           (file-equal-p src-path target-path))
-      (equal (file-local-name src-path)
-             (file-local-name target-path))))
+  (let ((local-src-path (file-local-name src-path))
+        (local-target-path (file-local-name target-path)))
+    ;; Compiler debug paths are local components when compilation occurs over
+    ;; TRAMP.  Do not resolve them on the local machine while parsing output.
+    (if rmsbolt--remote-path-comparison
+        (equal local-src-path local-target-path)
+      ;; When possible verify the file's existence, otherwise fall back to
+      ;; comparing paths.  The fallback is necessary when the paths provided
+      ;; are the local components of remote paths that don't exist locally.
+      (or (and (equal (file-remote-p src-path)
+                      (file-remote-p target-path))
+               (file-equal-p src-path target-path))
+          (equal local-src-path local-target-path)))))
 
 ;;;; Language Functions
 ;;;;; Compile Commands
@@ -1484,7 +1492,11 @@ Argument ASM-LINES input lines."
   "Process and filter a set of ASM-LINES from SRC-BUFFER.
 
 Essentially a switch that chooses which processing function to use."
-  (let* ((lang (with-current-buffer src-buffer
+  (let* ((rmsbolt--remote-path-comparison
+          (file-remote-p
+           (or (buffer-file-name src-buffer)
+               (buffer-local-value 'default-directory src-buffer))))
+         (lang (with-current-buffer src-buffer
                  (rmsbolt--get-lang)))
          (process-asm-fn (when lang
                            (rmsbolt-l-process-asm-custom-fn lang))))

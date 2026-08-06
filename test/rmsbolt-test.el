@@ -12,6 +12,31 @@
   "Check if ERT is working. :)"
   (should t))
 
+(ert-deftest remote-path-comparison-skips-file-truename ()
+  "Do not canonicalize compiler debug paths from a remote source buffer."
+  (with-temp-buffer
+    (setq-local buffer-file-name "/ssh:test@example:/remote/source.rs")
+    (setq-local rmsbolt-language-descriptor
+                (make-rmsbolt-lang
+                 :process-asm-custom-fn
+                 (lambda (_src-buffer _asm-lines)
+                   (rmsbolt--file-equal-p "/remote/source.rs"
+                                           "/remote/std.rs"))))
+    (cl-letf (((symbol-function 'file-equal-p)
+               (lambda (&rest _)
+                 (ert-fail "Remote path comparison called file-equal-p"))))
+      (should-not (rmsbolt--process-asm-lines (current-buffer) nil)))))
+
+(ert-deftest local-path-comparison-keeps-file-equal-p ()
+  "Keep filesystem-aware path equivalence for local buffers."
+  (let ((calls 0))
+    (cl-letf (((symbol-function 'file-equal-p)
+               (lambda (&rest _)
+                 (setq calls (1+ calls))
+                 t)))
+      (should (rmsbolt--file-equal-p "/first/path" "/second/path"))
+      (should (= calls 1)))))
+
 (defun test-asm-preprocessor (pre post)
   "Tests the asm preprocessor on the current buffer."
   (insert-file-contents pre)
