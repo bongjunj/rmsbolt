@@ -499,20 +499,19 @@ Use SRC-BUFFER as buffer containing local variables."
           (no-src-filename (rmsbolt--handle-c-compile-cmd src-buffer))
           (asm-format (buffer-local-value 'rmsbolt-asm-format src-buffer))
           (disass (buffer-local-value 'rmsbolt-disassemble src-buffer))
+          (opt-level (buffer-local-value 'rmsbolt-opt-level src-buffer))
           (cmd (buffer-local-value 'rmsbolt-command src-buffer))
           (cmd (string-join
-                (list cmd
-                      "-g"
-                      (if disass
-                          "-c"
-                        "-S")
-                      (if no-src-filename
-                          ""
-                        src-filename)
-                      "-o" output-filename
-                      (when (and (not (booleanp asm-format))
-                                 (not disass))
-                        (concat "-masm=" asm-format)))
+                (delq nil
+                      (list cmd
+                            "-g"
+                            (if disass "-c" "-S")
+                            (if no-src-filename "" src-filename)
+                            (when opt-level (format "-O%s" opt-level))
+                            "-o" output-filename
+                            (when (and (not (booleanp asm-format))
+                                       (not disass))
+                              (concat "-masm=" asm-format))))
                 " "))
           (cmd (rmsbolt--c-quirks cmd :src-buffer src-buffer)))
      cmd)))
