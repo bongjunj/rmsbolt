@@ -40,6 +40,10 @@ Once installed, use the ~rmsbolt-starter~ command to generate starter files, or
 enable ~rmsbolt-mode~ in a supported language. Then run ~rmsbolt-compile~ or use
 the default ~C-c C-c~ binding to pop open a disassembly buffer. After the first
 run, the buffer should automatically update.
+
+Each source buffer has its own RMSbolt output and compilation buffers.  Multiple
+source files can be compiled at the same time; recompiling one source does not
+replace or cancel another source's output.
 * Configuring
 
 RMSbolt is primarily configured with Emacs local variables. This lets you change

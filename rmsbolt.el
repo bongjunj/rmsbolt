@@ -232,7 +232,6 @@ may not be cleared to default as variables are usually."
   :group 'rmsbolt)
 
 ;;;; Variables:
-(defvar rmsbolt-output-buffer "*rmsbolt-output*")
 ;; whether rmsbolt-mode is enabled.
 (defvar rmsbolt-mode)
 
@@ -245,17 +244,15 @@ may not be cleared to default as variables are usually."
 (defvar-local rmsbolt--last-point nil
   "Used to detect when the point has moved.")
 
-(defvar rmsbolt-overlays nil
-  "List of overlays to use.")
 (defvar rmsbolt-compile-delay 0.4
   "Time in seconds to delay before recompiling if there is a change.")
-(defvar rmsbolt--automated-compile nil
+(defvar-local rmsbolt--automated-compile nil
   "Whether this compile was automated or not.")
 (defvar rmsbolt--shell "bash"
   "Which shell to prefer if available.
 Used to work around inconsistencies in alternative shells.")
 
-(defvar rmsbolt--temp-dir nil
+(defvar-local rmsbolt--temp-dir nil
   "Temporary directory to use for compilation and other reasons.
 
 Please DO NOT modify this blindly, as this directory will get
@@ -286,16 +283,109 @@ Useful if you have multiple objdumpers and want to select between them")
 (defvar rmsbolt--remote-path-comparison nil
   "Non-nil while processing source paths from a remote buffer.")
 
+(cl-defstruct (rmsbolt-session
+               (:constructor rmsbolt--make-session))
+  "State owned by one RMSbolt source buffer."
+  source output-buffer compilation-buffer temp-dir overlays change-timer)
+
+(defvar-local rmsbolt--session nil
+  "The RMSbolt session associated with the current buffer.")
+
 ;;;; Variable-like funcs
+(defun rmsbolt--temp-root (buffer)
+  "Return the shared temporary root for BUFFER's remote connection."
+  (with-current-buffer buffer
+    (let* ((remote-components (file-remote-p (or (buffer-file-name)
+                                                  default-directory)))
+           (temp-directory (gethash remote-components rmsbolt--temp-dirs-hash)))
+      (unless temp-directory
+        (puthash remote-components (make-nearby-temp-file "rmsbolt-" t)
+                 rmsbolt--temp-dirs-hash)
+        (setq temp-directory (gethash remote-components rmsbolt--temp-dirs-hash))
+        (add-hook 'kill-emacs-hook
+                  (lambda ()
+                    (when (and temp-directory
+                               (file-directory-p temp-directory)
+                               (string-match "rmsbolt"
+                                             (file-name-nondirectory temp-directory)))
+                      (delete-directory temp-directory t)))))
+      temp-directory)))
+
+(defun rmsbolt--source-label (source-buffer)
+  "Return a readable, project-relative label for SOURCE-BUFFER."
+  (with-current-buffer source-buffer
+    (if-let ((file (buffer-file-name)))
+        (let ((root (locate-dominating-file file ".git")))
+          (if root
+              (file-relative-name file root)
+            (file-name-nondirectory file)))
+      (buffer-name source-buffer))))
+
+(defun rmsbolt--session-buffer-name (session type)
+  "Return SESSION's buffer name for TYPE, disambiguating duplicate labels."
+  (let* ((source (rmsbolt-session-source session))
+         (label (rmsbolt--source-label source))
+         (prefix (pcase type
+                   ('output "*rmsbolt-output:")
+                   ('compilation "*rmsbolt-compilation:")
+                   (_ (error "Unknown RMSbolt buffer type: %S" type))))
+         (base (concat prefix label "*"))
+         (existing (get-buffer base)))
+    (if (or (not existing)
+            (eq (buffer-local-value 'rmsbolt--session existing) session))
+        base
+      (format "%s%s<%s>*" prefix label
+              (substring (secure-hash 'sha1
+                                      (with-current-buffer source
+                                        (or (buffer-file-name) (buffer-name))))
+                         0 8)))))
+
+(defun rmsbolt--ensure-session (&optional source-buffer)
+  "Return SOURCE-BUFFER's RMSbolt session, creating it when necessary."
+  (let ((source-buffer (or source-buffer (current-buffer))))
+    (with-current-buffer source-buffer
+      (or rmsbolt--session
+          (let* ((temp-root (rmsbolt--temp-root source-buffer))
+                 (temp-dir (make-nearby-temp-file
+                            (expand-file-name "session-" temp-root) t))
+                 (session (rmsbolt--make-session :source source-buffer
+                                                  :temp-dir temp-dir)))
+            (setq-local rmsbolt--session session)
+            (setq-local rmsbolt--temp-dir temp-dir)
+            session)))))
+
+(defun rmsbolt--session-output-buffer (session)
+  "Return SESSION's output buffer, creating it if needed."
+  (or (and (buffer-live-p (rmsbolt-session-output-buffer session))
+           (rmsbolt-session-output-buffer session))
+      (let ((buffer (get-buffer-create (rmsbolt--session-buffer-name session 'output))))
+        (setf (rmsbolt-session-output-buffer session) buffer)
+        (with-current-buffer buffer
+          (setq-local rmsbolt--session session)
+          (setq-local rmsbolt-src-buffer (rmsbolt-session-source session)))
+        buffer)))
+
+(defun rmsbolt--session-compilation-buffer-name (session)
+  "Return SESSION's dedicated compilation buffer name."
+  (rmsbolt--session-buffer-name session 'compilation))
+
+(defun rmsbolt--source-session-p (&optional buffer)
+  "Return non-nil when BUFFER is the source buffer of its RMSbolt session."
+  (with-current-buffer (or buffer (current-buffer))
+    (and rmsbolt--session
+         (eq (current-buffer) (rmsbolt-session-source rmsbolt--session)))))
+
 (defun rmsbolt-output-filename (src-buffer &optional asm)
   "Function for generating an output filename for SRC-BUFFER.
 
 Outputs assembly file if ASM.
 This function does NOT quote the return value for use in inferior shells."
-  (if (and (not asm)
-           (buffer-local-value 'rmsbolt-disassemble src-buffer))
-      (expand-file-name "rmsbolt.o" rmsbolt--temp-dir)
-    (expand-file-name "rmsbolt.s" rmsbolt--temp-dir)))
+  (let ((temp-dir (rmsbolt-session-temp-dir
+                   (rmsbolt--ensure-session src-buffer))))
+    (if (and (not asm)
+             (buffer-local-value 'rmsbolt-disassemble src-buffer))
+        (expand-file-name "rmsbolt.o" temp-dir)
+      (expand-file-name "rmsbolt.s" temp-dir))))
 
 ;;;; Regexes
 
@@ -1600,21 +1690,20 @@ Argument OVERRIDE-BUFFER asm src buffer to use instead of reading
 Argument STOPPED The compilation was stopped to start another compilation."
   (when (not (buffer-live-p buffer))
     (error "Dead buffer passed to compilation-finish-function! RMSBolt cannot continue"))
-  (let ((compilation-fail
-         (and str
-              (not (string-match "^finished" str))))
-        (src-default-directory (buffer-local-value 'default-directory buffer))
-        (src-buffer (buffer-local-value 'rmsbolt-src-buffer buffer)))
-
-    (with-current-buffer (get-buffer-create rmsbolt-output-buffer)
-      (setq default-directory src-default-directory)
-      ;; Store src buffer value for later linking
-      (cond (stopped) ; Do nothing
-            ((not compilation-fail)
-             (if (and (not override-buffer)
-                      (not (file-exists-p (rmsbolt-output-filename src-buffer t))))
-                 (message "Error reading from output file.")
-               (let ((lines
+  (let* ((session (buffer-local-value 'rmsbolt--session buffer))
+         (src-buffer (and session (rmsbolt-session-source session)))
+         (compilation-fail (and str (not (string-match "^finished" str))))
+         (src-default-directory (buffer-local-value 'default-directory buffer)))
+    (when (and session (buffer-live-p src-buffer))
+      (cond
+       (stopped nil)
+       ((not compilation-fail)
+        (if (and (not override-buffer)
+                 (not (file-exists-p (rmsbolt-output-filename src-buffer t))))
+            (message "Error reading from output file.")
+          (with-current-buffer (rmsbolt--session-output-buffer session)
+            (setq default-directory src-default-directory)
+            (let ((lines
                       (rmsbolt--process-asm-lines
                        src-buffer
                        (or (when override-buffer
@@ -1627,65 +1716,61 @@ Argument STOPPED The compilation was stopped to start another compilation."
                      (linum 1)
                      (start-match nil)
                      (in-match nil)
-                     (output-buffer (current-buffer)))
-                 ;; Add lines to hashtable
-                 (dolist (line lines)
-                   (let ((property
-                          (get-text-property
-                           0 'rmsbolt-src-line line)))
-                     (cl-tagbody
-                      run-conditional
-                      (cond
-                       ((and in-match (eq in-match property))
-                        ;; We are continuing an existing match
-                        nil)
-                       (in-match
-                        ;; We are in a match that has just expired
-                        (push (cons start-match (1- linum))
-                              (gethash in-match ht))
-                        (setq in-match nil
-                              start-match nil)
-                        (go run-conditional))
-                       (property
-                        (setq in-match property
-                              start-match linum)))))
-                   (cl-incf linum))
-
-                 (with-current-buffer src-buffer
-                   (setq rmsbolt-line-mapping ht))
-
-                 ;; Replace buffer contents but save point and scroll
-                 (let* ((window (get-buffer-window output-buffer))
-                        (old-point (window-point window))
-                        (old-window-start (window-start window)))
-                   (erase-buffer)
-                   (insert (string-join lines "\n"))
-                   (when window
-                     (set-window-start window old-window-start)
-                     (set-window-point window old-point)))
-                 (asm-mode)
-                 (rmsbolt-mode 1)
-                 (setq rmsbolt-src-buffer src-buffer)
-                 (display-buffer (current-buffer) '(nil (inhibit-same-window . t)))
-                 (run-at-time 0 nil #'rmsbolt-update-overlays))))
-            (t ; Compilation failed
-             ;; Display compilation buffer
-             (if rmsbolt--automated-compile
-                 (display-buffer buffer '(nil (inhibit-same-window . t)))
-               ;; If the compilation was directly started by the user,
-               ;; select the compilation buffer.
-               (pop-to-buffer buffer))
-             ;; TODO find a cleaner way to disable overlays.
-             (with-current-buffer src-buffer
-               (setq rmsbolt-line-mapping nil))
-             (rmsbolt--remove-overlays)))
-      ;; Reset automated recompile
-      (setq rmsbolt--automated-compile nil))
-    ;; Clear out default-set variables
-    (with-current-buffer src-buffer
-      (dolist (var rmsbolt--default-variables)
-        (rmsbolt--set-local var nil))
-      (setq rmsbolt--default-variables nil))))
+                   (output-buffer (current-buffer)))
+              ;; Add lines to hashtable
+              (dolist (line lines)
+                (let ((property (get-text-property 0 'rmsbolt-src-line line)))
+                  (cl-tagbody
+                   run-conditional
+                   (cond
+                    ((and in-match (eq in-match property)) nil)
+                    (in-match
+                     (push (cons start-match (1- linum)) (gethash in-match ht))
+                     (setq in-match nil start-match nil)
+                     (go run-conditional))
+                    (property (setq in-match property start-match linum)))))
+                (cl-incf linum))
+              (with-current-buffer src-buffer
+                (setq rmsbolt-line-mapping ht))
+              ;; Replace buffer contents but save point and scroll.
+              (let* ((window (get-buffer-window output-buffer))
+                     (old-point (window-point window))
+                     (old-window-start (window-start window)))
+                (erase-buffer)
+                (insert (string-join lines "\n"))
+                (when window
+                  (set-window-start window old-window-start)
+                  (set-window-point window old-point)))
+              (asm-mode)
+              ;; `asm-mode' clears buffer-local variables.  Restore the
+              ;; source-owned session before enabling RMSbolt in this output
+              ;; buffer so both sides share overlays and navigation state.
+              (setq-local rmsbolt--session session)
+              (setq-local rmsbolt-src-buffer src-buffer)
+              (rmsbolt-mode 1)
+              (display-buffer (current-buffer) '(nil (inhibit-same-window . t)))
+              (run-at-time 0 nil
+                           (lambda (output-buffer)
+                             (when (buffer-live-p output-buffer)
+                               (with-current-buffer output-buffer
+                                 (rmsbolt-update-overlays))))
+                           output-buffer)))))
+       (t
+        ;; Display compilation errors for this session only.
+        (if (buffer-local-value 'rmsbolt--automated-compile buffer)
+            (display-buffer buffer '(nil (inhibit-same-window . t)))
+          (pop-to-buffer buffer))
+        (with-current-buffer src-buffer
+          (setq rmsbolt-line-mapping nil))
+        (rmsbolt--remove-overlays session)))
+      (with-current-buffer buffer
+        (setq rmsbolt--automated-compile nil))
+      ;; Clear out default-set variables.
+      (with-current-buffer src-buffer
+        (dolist (var rmsbolt--default-variables)
+          (rmsbolt--set-local var nil))
+        (setq rmsbolt--default-variables nil
+              rmsbolt--automated-compile nil)))))
 
 ;;;;; Parsing Options
 (defun rmsbolt--get-lang ()
@@ -1769,8 +1854,6 @@ Are you running two compilations at the same time?"))
              (yes-or-no-p (format "Save buffer %s? " (buffer-name))))
     (save-buffer))
   (rmsbolt--gen-temp)
-  ;; Current buffer = src-buffer at this point
-  (setq rmsbolt-src-buffer (current-buffer))
   (cond
    ((derived-mode-p 'asm-mode)
     ;; We cannot compile asm-mode files
@@ -1781,10 +1864,11 @@ Are you running two compilations at the same time?"))
        (rmsbolt-l-elisp-compile-override (rmsbolt--get-lang))
        :src-buffer (current-buffer))))
    (t
-    (rmsbolt--stop-running-compilation)
-    (rmsbolt--parse-options)
     (let* ((src-buffer (current-buffer))
-           (lang (rmsbolt--get-lang))
+           (session (rmsbolt--ensure-session src-buffer)))
+      (rmsbolt--stop-running-compilation session)
+      (rmsbolt--parse-options)
+      (let* ((lang (rmsbolt--get-lang))
            (func (rmsbolt-l-compile-cmd-function lang))
            ;; Generate command
            (cmd
@@ -1800,10 +1884,9 @@ Are you running two compilations at the same time?"))
            (src-default-directory (or rmsbolt-default-directory
                                   rmsbolt--temp-dir))
            (default-directory src-default-directory))
-      (run-hooks 'rmsbolt-after-parse-hook)
-      (when (buffer-local-value 'rmsbolt-disassemble src-buffer)
-        (pcase
-            (rmsbolt-l-objdumper lang)
+        (run-hooks 'rmsbolt-after-parse-hook)
+        (when (buffer-local-value 'rmsbolt-disassemble src-buffer)
+          (pcase (rmsbolt-l-objdumper lang)
           ('objdump
            (setq cmd
                  (string-join
@@ -1837,35 +1920,44 @@ Are you running two compilations at the same time?"))
                   " ")))
           (_
            (error "Objdumper not recognized"))))
-      ;; Convert to demangle if we need to
-      (setq cmd (rmsbolt--demangle-command cmd lang src-buffer))
-      (with-current-buffer ; With compilation buffer
-          (let ((shell-file-name (or (executable-find rmsbolt--shell)
-                                     shell-file-name))
-                (compilation-auto-jump-to-first-error t))
-            ;; TODO should this be configurable?
-            (rmsbolt-with-display-buffer-no-window
-             (compilation-start cmd nil (lambda (&rest _) "*rmsbolt-compilation*"))))
+        ;; Convert to demangle if we need to
+        (setq cmd (rmsbolt--demangle-command cmd lang src-buffer))
+        (let ((compilation-buffer
+               (let ((shell-file-name (or (executable-find rmsbolt--shell)
+                                           shell-file-name))
+                     (compilation-auto-jump-to-first-error t)
+                     (name (rmsbolt--session-compilation-buffer-name session)))
+                 (rmsbolt-with-display-buffer-no-window
+                  (compilation-start cmd nil (lambda (&rest _) name))))))
+          (setf (rmsbolt-session-compilation-buffer session) compilation-buffer)
+          (with-current-buffer compilation-buffer
         ;; Make sure the compilation hooks use the same temporary directory as
         ;; the buffer being compiled.
-        (setq-local default-directory src-default-directory)
+            (setq-local default-directory src-default-directory)
         ;; Only jump to errors, skip over warnings
-        (setq-local compilation-skip-threshold 2)
-        (add-hook 'compilation-finish-functions
-                  #'rmsbolt--handle-finish-compile nil t)
-        (setq rmsbolt-src-buffer src-buffer))))))
+            (setq-local compilation-skip-threshold 2)
+            (setq-local rmsbolt--session session)
+            (setq-local rmsbolt-src-buffer src-buffer)
+            (setq-local rmsbolt--automated-compile
+                        (buffer-local-value 'rmsbolt--automated-compile src-buffer))
+            (add-hook 'compilation-finish-functions
+                      #'rmsbolt--handle-finish-compile nil t))))))))
 
-(defun rmsbolt--stop-running-compilation ()
-  "Cancel a compilation."
-  (when-let* ((compilation-buffer (get-buffer "*rmsbolt-compilation*"))
+(defun rmsbolt--stop-running-compilation (session &optional quietly)
+  "Cancel SESSION's compilation.
+When QUIETLY is non-nil, do not run RMSbolt's completion handler."
+  (when-let* ((compilation-buffer (rmsbolt-session-compilation-buffer session))
+              ((buffer-live-p compilation-buffer))
               (proc (get-buffer-process compilation-buffer)))
     (when (eq (process-status proc) 'run)
       (set-process-sentinel proc nil)
       (interrupt-process proc)
-      (rmsbolt--handle-finish-compile compilation-buffer nil :stopped t)
+      (unless quietly
+        (rmsbolt--handle-finish-compile compilation-buffer nil :stopped t))
       ;; Wait a short while for the process to exit cleanly
       (sit-for 0.2)
-      (delete-process proc))))
+      (delete-process proc)))
+  (setf (rmsbolt-session-compilation-buffer session) nil))
 
 ;;;; Keymap
 (defvar rmsbolt-mode-map
@@ -1877,26 +1969,8 @@ Are you running two compilations at the same time?"))
 ;;;; Init commands
 
 (defun rmsbolt--gen-temp ()
-  "Get a temporary directory close to the current buffer.  A new directory is
-created if needed.  Only one temporary directory exists per host so as to support
-compilation of remote files."
-  ;; Get this buffer's temporary directory.  Use the buffer's default directory
-  ;; if the current buffer isn't backed by a file.
-  (let* ((remote-components (file-remote-p (or (buffer-file-name)
-                                               default-directory)))
-        (temp-directory (gethash remote-components rmsbolt--temp-dirs-hash)))
-    ;; Create a temporary directory if we haven't already for this remote.
-    (unless temp-directory
-      (puthash remote-components (make-nearby-temp-file "rmsbolt-" t) rmsbolt--temp-dirs-hash)
-      (setq temp-directory (gethash remote-components rmsbolt--temp-dirs-hash))
-      ;; Make sure this directory is removed when we exit.
-      (add-hook 'kill-emacs-hook
-                (lambda ()
-                  (when (and temp-directory
-                             (file-directory-p temp-directory)
-                             (string-match "rmsbolt" (file-name-nondirectory temp-directory)))
-                    (delete-directory temp-directory t)))))
-    (setq rmsbolt--temp-dir temp-directory)))
+  "Ensure that the current source buffer has an RMSbolt session directory."
+  (rmsbolt--ensure-session (current-buffer)))
 
 ;;;;; Starter Definitions
 
@@ -1978,9 +2052,11 @@ Uses LANG-NAME to determine the language."
 If FORCE, always scroll overlay, even when one is visible.  FORCE also
 scrolls to the first line, instead of the first line of the last block."
   (when rmsbolt-mode
-    (if-let ((should-run rmsbolt-use-overlays)
-             (output-buffer (get-buffer rmsbolt-output-buffer))
-             (src-buffer (buffer-local-value 'rmsbolt-src-buffer output-buffer))
+    (if-let ((session rmsbolt--session)
+             (should-run rmsbolt-use-overlays)
+             (output-buffer (let ((buffer (rmsbolt-session-output-buffer session)))
+                              (and (buffer-live-p buffer) buffer)))
+             (src-buffer (rmsbolt-session-source session))
              (should-run (and (or (eq (current-buffer) src-buffer)
                                   (eq (current-buffer) output-buffer))
                               ;; Don't run on unsaved buffers
@@ -2007,9 +2083,9 @@ scrolls to the first line, instead of the first line of the last block."
                                  (with-current-buffer src-buffer
                                    (rmsbolt--point-visible (cl-first src-pts)))))))
           ;; Remove existing overlays
-          (rmsbolt--remove-overlays)
+          (rmsbolt--remove-overlays session)
           (push (rmsbolt--setup-overlay (cl-first src-pts) (cl-second src-pts) src-buffer)
-                rmsbolt-overlays)
+                (rmsbolt-session-overlays session))
           (with-current-buffer output-buffer
             (let ((saved-pt (point)))
               (save-excursion
@@ -2024,7 +2100,7 @@ scrolls to the first line, instead of the first line of the last block."
                                                        (rmsbolt--point-visible end-pt)
                                                        (< start-pt saved-pt end-pt))))
                               (push (rmsbolt--setup-overlay start-pt end-pt output-buffer)
-                                    rmsbolt-overlays)))))
+                                    (rmsbolt-session-overlays session)))))
             (when (or (not line-visible) force)
               ;; Scroll buffer to first line
               (when-let ((scroll-buffer (if scroll-src-buffer-p
@@ -2042,15 +2118,16 @@ scrolls to the first line, instead of the first line of the last block."
                 (with-selected-window window
                   (rmsbolt--goto-line line-scroll)
                   ;; If we scrolled, recenter
-                  (recenter))))))
-      (rmsbolt--remove-overlays))
+                  (recenter)))))))
+      (rmsbolt--remove-overlays rmsbolt--session))
     ;; If not in rmsbolt-mode, don't do anything
     ))
 
-(defun rmsbolt--remove-overlays ()
-  "Clean up overlays, assuming they are no longer needed."
-  (mapc #'delete-overlay rmsbolt-overlays)
-  (setq rmsbolt-overlays nil))
+(defun rmsbolt--remove-overlays (&optional session)
+  "Clean up overlays owned by SESSION or the current buffer's session."
+  (when-let ((session (or session rmsbolt--session)))
+    (mapc #'delete-overlay (rmsbolt-session-overlays session))
+    (setf (rmsbolt-session-overlays session) nil)))
 
 (defun rmsbolt--post-command-hook ()
   "Update overlays and perform book-keeping post-compile."
@@ -2060,17 +2137,38 @@ scrolls to the first line, instead of the first line of the last block."
     (setq rmsbolt--last-point (point))
     (rmsbolt-update-overlays)))
 
+(defun rmsbolt--cleanup-session (session)
+  "Dispose of SESSION after its source buffer is killed."
+  (let ((output-buffer (rmsbolt-session-output-buffer session))
+        (compilation-buffer (rmsbolt-session-compilation-buffer session)))
+    (when-let ((timer (rmsbolt-session-change-timer session)))
+      (cancel-timer timer)
+      (setf (rmsbolt-session-change-timer session) nil))
+    (rmsbolt--stop-running-compilation session t)
+    (rmsbolt--remove-overlays session)
+    (dolist (buffer (list output-buffer compilation-buffer))
+      (when (and (buffer-live-p buffer)
+                 (not (eq buffer (current-buffer))))
+        (kill-buffer buffer)))
+    (when-let ((temp-dir (rmsbolt-session-temp-dir session)))
+      (when (file-directory-p temp-dir)
+        (delete-directory temp-dir t))
+      (setf (rmsbolt-session-temp-dir session) nil))
+    (setf (rmsbolt-session-output-buffer session) nil
+          (rmsbolt-session-compilation-buffer session) nil)))
+
 (defun rmsbolt--on-kill-buffer ()
   "Perform cleanup if the user deletes the buffer."
-  (when-let (output-buffer (get-buffer rmsbolt-output-buffer))
-    (when (or (eq (current-buffer) output-buffer)
-              (eq (current-buffer) (buffer-local-value 'rmsbolt-src-buffer output-buffer)))
-      (rmsbolt--remove-overlays))))
+  (when-let ((session rmsbolt--session))
+    (if (rmsbolt--source-session-p)
+        (rmsbolt--cleanup-session session)
+      (when (eq (current-buffer) (rmsbolt-session-output-buffer session))
+        (rmsbolt--remove-overlays session)
+        (setf (rmsbolt-session-output-buffer session) nil)))))
 
 (defun rmsbolt--is-active-src-buffer ()
   "Helper to see if our src buffer is active."
-  (when-let (output-buffer (get-buffer rmsbolt-output-buffer))
-    (eq (current-buffer) (buffer-local-value 'rmsbolt-src-buffer output-buffer))))
+  (rmsbolt--source-session-p))
 
 (defun rmsbolt--after-save ()
   "Handle automated compile and other after-safe functions."
@@ -2081,25 +2179,26 @@ scrolls to the first line, instead of the first line of the last block."
 
 ;; Auto-save the src buffer after it has been unchanged for `rmsbolt-compile-delay' seconds.
 ;; The buffer is then automatically recompiled via `rmsbolt--after-save'.
-(defvar rmsbolt--change-timer nil)
-(defvar rmsbolt--buffer-to-auto-save nil)
 
 (defun rmsbolt--after-change (&rest _)
   "Handle automatic recompile and other functions after edit."
   (when (and (rmsbolt--is-active-src-buffer)
              rmsbolt-automatic-recompile
              (not (eq rmsbolt-automatic-recompile 'on-save)))
-    (when rmsbolt--change-timer
-      (cancel-timer rmsbolt--change-timer))
-    (setq rmsbolt--buffer-to-auto-save (current-buffer)
-          rmsbolt--change-timer (run-with-timer rmsbolt-compile-delay nil #'rmsbolt--on-change-timer))))
+    (let ((session rmsbolt--session)
+          (source-buffer (current-buffer)))
+      (when (rmsbolt-session-change-timer session)
+        (cancel-timer (rmsbolt-session-change-timer session)))
+      (setf (rmsbolt-session-change-timer session)
+            (run-with-timer rmsbolt-compile-delay nil
+                            #'rmsbolt--on-change-timer source-buffer)))))
 
-(defun rmsbolt--on-change-timer ()
-  "Hook to run on automatic recompile timer."
-  (setq rmsbolt--change-timer nil)
-  (when (buffer-live-p rmsbolt--buffer-to-auto-save)
-    (with-current-buffer rmsbolt--buffer-to-auto-save
-      (setq rmsbolt--buffer-to-auto-save nil)
+(defun rmsbolt--on-change-timer (source-buffer)
+  "Handle SOURCE-BUFFER's automatic recompile timer."
+  (when (buffer-live-p source-buffer)
+    (with-current-buffer source-buffer
+      (when rmsbolt--session
+        (setf (rmsbolt-session-change-timer rmsbolt--session) nil))
       (when (or (< (line-number-at-pos (point-max)) rmsbolt-large-buffer-size)
                 (eq rmsbolt-automatic-recompile 'force))
         ;; Clear `before-save-hook' to prevent things like whitespace cleanup
@@ -2123,20 +2222,22 @@ This mode is enabled in both src and assembly output buffers."
   ;; Init
   (cond
    (rmsbolt-mode
+    (unless rmsbolt--session
+      (rmsbolt--ensure-session (current-buffer)))
     (setq rmsbolt--last-point (point))
     (add-hook 'post-command-hook #'rmsbolt--post-command-hook nil t)
     (add-hook 'kill-buffer-hook #'rmsbolt--on-kill-buffer nil t)
 
     (when (and rmsbolt-automatic-recompile
                ;; Only turn on auto-save in src buffers
-               (not (eq (current-buffer) (get-buffer rmsbolt-output-buffer))))
+               (rmsbolt--source-session-p))
       (add-hook 'after-save-hook #'rmsbolt--after-save nil t)
       (when (eq rmsbolt-automatic-recompile t)
         (add-hook 'after-change-functions #'rmsbolt--after-change nil t)))
 
     (rmsbolt--gen-temp))
    (t ;; Cleanup
-    (rmsbolt--remove-overlays)
+    (rmsbolt--remove-overlays rmsbolt--session)
     (remove-hook 'after-change-functions #'rmsbolt--after-change t)
     (remove-hook 'after-save-hook #'rmsbolt--after-save t)
     (remove-hook 'kill-buffer-hook #'rmsbolt--on-kill-buffer t)
