@@ -629,19 +629,20 @@ Use SRC-BUFFER as buffer for local variables."
    src-buffer
    (let* ((asm-format (buffer-local-value 'rmsbolt-asm-format src-buffer))
           (disass (buffer-local-value 'rmsbolt-disassemble src-buffer))
+          (opt-level (buffer-local-value 'rmsbolt-opt-level src-buffer))
           (cmd (buffer-local-value 'rmsbolt-command src-buffer))
           (cmd (string-join
-                (list cmd
-                      "-g"
-                      "--emit"
-                      (if disass
-                          "link"
-                        "asm")
-                      src-filename
-                      "-o" output-filename
-                      (when (and (not (booleanp asm-format))
-                                 (not disass))
-                        (concat "-Cllvm-args=--x86-asm-syntax=" asm-format)))
+                (delq nil
+                      (list cmd
+                            "-g"
+                            "--emit"
+                            (if disass "link" "asm")
+                            src-filename
+                            "-o" output-filename
+                            (when opt-level (format "-C opt-level=%s" opt-level))
+                            (when (and (not (booleanp asm-format))
+                                       (not disass))
+                              (concat "-Cllvm-args=--x86-asm-syntax=" asm-format))))
                 " ")))
      cmd)))
 
@@ -2141,6 +2142,24 @@ This mode is enabled in both src and assembly output buffers."
     (remove-hook 'after-save-hook #'rmsbolt--after-save t)
     (remove-hook 'kill-buffer-hook #'rmsbolt--on-kill-buffer t)
     (remove-hook 'post-command-hook #'rmsbolt--post-command-hook t))))
+
+(defcustom rmsbolt-opt-level nil
+  "Optimization level for supported RMSbolt compilers.
+  A string from \"0\" through \"3\", or nil to omit an optimization flag."
+  :type '(choice (const :tag "Compiler default" nil)
+                 (string :tag "Level"))
+  :safe (lambda (value)
+          (or (null value)
+              (member value '("0" "1" "2" "3"))))
+  :group 'rmsbolt)
+
+(defun rmsbolt-change-opt (level)
+    "Set RMSbolt optimization LEVEL in the current buffer."
+    (interactive
+     (list (completing-read "Optimization level: "
+                            '("0" "1" "2" "3") nil t)))
+    (setq-local rmsbolt-opt-level level)
+    (rmsbolt-compile))
 
 ;;;###autoload
 (defun rmsbolt ()
